@@ -18,8 +18,17 @@ class GeminiVLM:
 
     def analyze(self, scene_id: str, frames: list, evidence: list[dict] | None = None) -> SemanticScene:
         contents = [{"text": prompt_for_taxonomy() + f"\nScene ID: {scene_id}\nReturn JSON only."}]
+        uploaded = set()
         for frame in frames:
-            contents.append({"text": f"Frame camera={frame.camera}, timestamp_s={frame.timestamp_s}, uri={frame.frame_uri}"})
+            uri = str(frame.frame_uri)
+            # Real Gemini clients need a Files API object for local media. Mock
+            # clients used by tests may not expose ``files``; retain metadata
+            # text in that case so the adapter remains independently testable.
+            if hasattr(self.client, "files") and Path(uri).exists() and uri not in uploaded:
+                remote = self.client.files.upload(file=uri)
+                contents.append({"file_data": {"file_uri": remote.uri, "mime_type": getattr(remote, "mime_type", "video/mp4")}})
+                uploaded.add(uri)
+            contents.append({"text": f"Frame camera={frame.camera}, timestamp_s={frame.timestamp_s}, uri={uri}"})
         last_error = None
         for attempt in range(self.max_retries):
             try:
