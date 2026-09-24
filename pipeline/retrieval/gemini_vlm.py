@@ -1,0 +1,2 @@
+"""Gemini VLM integration placeholder."""
+

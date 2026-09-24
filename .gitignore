@@ -1,0 +1,27 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python virtual environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Local temporary files
+tmp-venv/
+tmp/
+*.tmp
+
+# Generated artifacts
+artifacts/semantic/*
+!artifacts/semantic/.gitkeep
+
+# Large video inputs (keep videos local unless explicitly added with Git LFS)
+data/**/*.mp4
+data/**/*.mov
+data/**/*.avi
