@@ -1,3 +1,10 @@
 google-genai
 python-dotenv
-
+pydantic>=2
+numpy
+pandas
+pyarrow
+faiss-cpu
+opencv-python-headless
+pyyaml
+pytest

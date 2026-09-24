@@ -10,7 +10,7 @@ client = genai.Client(
 )
 
 response = client.interactions.create(
-    model="gemini-3.8-flash",
+    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
     input="Say hello and tell me that the API is working."
 )
 

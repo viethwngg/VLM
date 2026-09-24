@@ -10,6 +10,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
+pytest-cache-files-*/
 .mypy_cache/
 
 # Local temporary files
@@ -20,6 +21,8 @@ tmp/
 # Generated artifacts
 artifacts/semantic/*
 !artifacts/semantic/.gitkeep
+artifacts/embeddings/*
+artifacts/index/*
 
 # Large video inputs (keep videos local unless explicitly added with Git LFS)
 data/**/*.mp4

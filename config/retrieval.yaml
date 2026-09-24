@@ -1,0 +1,14 @@
+semantic:
+  data_root: data
+  output_root: artifacts/semantic
+  camera: CAM_FRONT
+  num_frames: 8
+  prompt_version: road-vlm-v1
+embedding:
+  provider: local
+  model: hash-384
+  dimension: 384
+  normalize: true
+index:
+  type: IndexFlatIP
+  version: v1
