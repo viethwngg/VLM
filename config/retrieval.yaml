@@ -3,7 +3,7 @@ semantic:
   output_root: artifacts/semantic
   camera: CAM_FRONT
   num_frames: 8
-  prompt_version: road-vlm-v1
+  prompt_version: road-vlm-v2
 embedding:
   provider: local
   model: hash-384
