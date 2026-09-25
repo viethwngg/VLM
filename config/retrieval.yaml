@@ -5,10 +5,11 @@ semantic:
   num_frames: 8
   prompt_version: road-vlm-v2
 embedding:
-  provider: local
-  model: hash-384
-  dimension: 384
+  provider: gemini
+  model: gemini-embedding-2
+  dimension: 768
   normalize: true
 index:
   type: IndexFlatIP
+  dimension: 768
   version: v1

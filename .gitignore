@@ -10,6 +10,8 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
+.pytest-tmp/
+.test-work/
 pytest-cache-files-*/
 .mypy_cache/
 
