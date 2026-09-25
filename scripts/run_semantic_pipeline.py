@@ -20,8 +20,12 @@ def main():
         try:
             artifact = process_scene(scene_id, videos[0], output, cfg["semantic"]["camera"], cfg["semantic"]["num_frames"], args.force)
             logging.info("scene_id=%s status=success elapsed_s=%.3f artifact=%s", scene_id, time.perf_counter() - started, artifact)
-        except Exception:
-            logging.exception("scene_id=%s status=failed elapsed_s=%.3f", scene_id, time.perf_counter() - started)
-            raise
+        except Exception as exc:
+            logging.error("scene_id=%s status=failed elapsed_s=%.3f error=%s",
+                          scene_id, time.perf_counter() - started, exc)
+            return 1
     build_corpus(output)
-if __name__ == "__main__": main()
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

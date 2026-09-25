@@ -40,7 +40,7 @@ print("Video ACTIVE")
 
 # 3. Ask Gemini to understand it
 response = client.interactions.create(
-    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+    model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
 
     input=[
         {
