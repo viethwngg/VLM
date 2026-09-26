@@ -313,9 +313,38 @@ toàn rồi mở lại VS Code.
 
 ### `403` hoặc thiếu `iap.tunnelInstances.accessViaIAP`
 
-Chạy `gcloud auth list` và xác nhận account đang hoạt động là account đã được
-cấp quyền. Nếu vẫn lỗi, gửi thông báo lỗi cho quản trị viên để kiểm tra quyền
-IAP. Không tự thay đổi IAM.
+Kiểm tra account và project đang hoạt động:
+
+```powershell
+gcloud auth list
+gcloud config get-value account
+gcloud config get-value project
+```
+
+Nếu đang dùng nhầm account, đăng nhập bằng Google account đã được cấp quyền và
+kiểm tra account vừa đăng nhập:
+
+```powershell
+gcloud auth login
+gcloud auth list
+gcloud config set project project-0c6ab625-3efb-4fe3-934
+```
+
+Nếu có nhiều account, nhập email thật của account đã được cấp quyền khi
+PowerShell yêu cầu:
+
+```powershell
+$authorizedAccount = Read-Host "Google account đã được cấp quyền"
+gcloud config set account $authorizedAccount
+```
+
+Không nhập nguyên các chuỗi ví dụ hoặc placeholder như
+`YOUR_AUTHORIZED_EMAIL`; chúng không có credentials.
+
+Nếu account và project đều đúng nhưng lỗi báo thiếu `compute.instances.get`,
+gửi nguyên thông báo lỗi cho quản trị viên. Account cần một role tối thiểu chứa
+permission này (thường là **Compute Viewer**) và quyền IAP phù hợp (thường là
+**IAP-secured Tunnel User**). Không tự thay đổi IAM.
 
 ### `compute.instances.get` sau khi đã thấy prompt của VM
 
