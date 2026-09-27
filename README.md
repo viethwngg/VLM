@@ -226,6 +226,15 @@ Vector được chuyển sang `float32` và L2-normalize nhất quán trước k
 
 ### 4. Search
 
+Chạy không truyền query để nhập nội dung trực tiếp trong terminal:
+
+```powershell
+python .\scripts\search.py
+# Nhập nội dung cần tìm: pedestrian crossing while car turns right
+```
+
+Hoặc truyền query ngay trong lệnh:
+
 ```powershell
 python .\scripts\search.py `
   "pedestrian crossing while car turns right" `
