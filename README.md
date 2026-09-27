@@ -15,7 +15,7 @@ Metadata như agents, actions, locations, weather và events vẫn được lưu
 - `pipeline/retrieval/embedder.py`: Gemini Embedding 2, retry, validation và cache/resume.
 - `pipeline/retrieval/faiss_index.py`: kiểm tra artifact và xây `IndexFlatIP`.
 - `pipeline/retrieval/vector_search.py`: embed query, tìm top-K và map FAISS ID về `scene_id`.
-- `scripts/run_semantic_pipeline.py`: xử lý video theo scene.
+- `scripts/run_semantic_pipeline.py`: quét và xử lý toàn bộ video theo scene.
 - `scripts/build_embeddings.py`: tạo/cập nhật embedding corpus.
 - `scripts/build_faiss_index.py`: xây FAISS index.
 - `scripts/search.py`: tìm kiếm vector từ command line.
@@ -119,6 +119,15 @@ Mỗi dòng cần tối thiểu:
 
 ### 1. Tạo semantic metadata
 
+Chạy không có tham số sẽ tự động quét đệ quy và xử lý toàn bộ video trong
+`data/`:
+
+```powershell
+python .\scripts\run_semantic_pipeline.py
+```
+
+Xử lý một scene cụ thể:
+
 ```powershell
 python .\scripts\run_semantic_pipeline.py --scene-id scene-0061
 ```
@@ -134,6 +143,40 @@ Tạo lại artifact đã tồn tại:
 ```powershell
 python .\scripts\run_semantic_pipeline.py --scene-id scene-0061 --force
 ```
+
+#### Các function của VLM runner
+
+- `discover_video_jobs(data_root, scene_id=None)`: quét đệ quy toàn bộ thư mục
+  dữ liệu và trả về danh sách cặp `(scene_id, video_path)`. Các định dạng được
+  hỗ trợ gồm `.mp4`, `.mov`, `.mkv`, `.avi` và `.webm`. Có thể truyền
+  `scene_id` để chỉ lấy video thuộc một scene, theo tên thư mục, ID đã sinh hoặc
+  tên file không có phần mở rộng.
+- `_path_id(path)`: chuyển đường dẫn tương đối thành ID ổn định dùng làm tên thư
+  mục artifact. Nếu một thư mục có nhiều video, tên video được nối vào ID để
+  các kết quả không ghi đè lên nhau.
+- `process_scene_with_timing(...)`: chạy `process_scene()` cho một video, đồng
+  thời ghi log thời điểm bắt đầu, trạng thái, đường dẫn video, thời gian xử lý
+  và artifact đầu ra.
+- `format_duration(elapsed_s)`: định dạng thời gian chạy thành
+  `HH:MM:SS.mmm` để hiển thị trong log.
+- `log_total_duration(...)`: tính và ghi log tổng thời gian chạy của toàn bộ
+  batch, kèm tổng số scene, số scene thành công, số scene thất bại và đường dẫn
+  semantic corpus.
+- `main()`: đọc `config/retrieval.yaml`, tìm toàn bộ video, xử lý tuần tự từng
+  video và tạo lại `semantic_corpus.jsonl`. Nếu một video lỗi, runner ghi lỗi
+  rồi tiếp tục với các video còn lại; sau cùng trả exit code `1` nếu có ít nhất
+  một video thất bại.
+
+Quy tắc tạo `scene_id`:
+
+- Một video trong thư mục: giữ tên thư mục, ví dụ
+  `data/scene-0061/cam_front.mp4` thành `scene-0061`.
+- Nhiều video trong cùng thư mục: nối thêm tên video, ví dụ
+  `scene-0061__cam_front` và `scene-0061__cam_back`.
+- Video nằm trực tiếp trong `data/`: dùng tên file không có phần mở rộng.
+
+Mặc định artifact đã tồn tại sẽ được bỏ qua. Dùng `--force` để phân tích lại.
+`--all` vẫn được giữ để tương thích và có cùng hành vi với chạy không tham số.
 
 ### 2. Tạo Gemini embedding
 
