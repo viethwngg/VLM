@@ -793,7 +793,7 @@ class GeminiBatchPipeline:
         if latest_jobs:
             self._write_root_job(latest_jobs)
         if succeeded:
-            build_corpus(self.output_root)
+            build_corpus(self.output_root, model=self.model)
         # Required stable aggregate path, while each split retains its own raw file.
         aggregate = self.batch_root / "batch_results_raw.jsonl"
         raw_files = [Path(data.get("raw_result", "")) for data in map(lambda p: _read_json(p, {}), self._job_files())]

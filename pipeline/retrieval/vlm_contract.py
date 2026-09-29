@@ -92,6 +92,10 @@ def parse_scene_payload(
     }
     scene = SemanticScene.model_validate(data)
     scene.searchable_text = build_searchable_text(scene)
+    if not scene.searchable_text:
+        raise ValueError(
+            f"Scene {scene_id} has no searchable_text or semantic fallback"
+        )
     return scene
 
 

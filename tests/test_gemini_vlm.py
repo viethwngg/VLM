@@ -70,6 +70,28 @@ def test_invalid_v3_output_is_rejected(payload):
         )
 
 
+def test_v3_output_without_retrieval_semantics_is_rejected():
+    payload = {
+        "scene": {
+            "road_type": None,
+            "traffic_state": None,
+            "weather": None,
+            "lighting": None,
+            "road_surface": None,
+        },
+        "ego": {"actions": []},
+        "agents": [],
+        "events": [],
+        "attention_events": [],
+        "searchable_text": "",
+    }
+
+    with pytest.raises(ValueError, match="no searchable_text or semantic fallback"):
+        parse_scene_payload(
+            payload, scene_id="scene-0061", evidence=[], model="gemini-test"
+        )
+
+
 def test_response_text_extracts_batch_candidates_and_detects_empty():
     response = {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
     assert response_text(response) == "{}"
