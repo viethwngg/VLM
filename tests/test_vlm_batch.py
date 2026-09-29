@@ -234,6 +234,57 @@ def test_prepare_skips_completed_splits_and_persists_manifest(
     assert all(item["status"] == "ACTIVE" for item in manifest.values())
 
 
+def test_prepare_ignores_submitted_jobs_from_an_old_vlm_contract(
+    workspace_tmp_path, fake_client, monkeypatch
+):
+    pipeline = make_pipeline(workspace_tmp_path, fake_client)
+    video = workspace_tmp_path / "data" / "scene" / "cam_front.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    stale_job = pipeline.batch_root / "batch_0001" / "batch_job.json"
+    stale_job.parent.mkdir(parents=True)
+    stale_job.write_text(
+        json.dumps({
+            "job_name": "batches/v2-job",
+            "request_keys": ["scene__CAM_FRONT"],
+            "status": "JOB_STATE_SUCCEEDED",
+            "model": "gemini-test",
+            "prompt_version": "road-vlm-v2",
+            "taxonomy_version": "road-v1",
+            "pipeline_version": "semantic-pipeline-v1",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "pipeline.retrieval.gemini_batch.sample_video",
+        lambda path, camera, count: frames(str(path)),
+    )
+
+    summary = pipeline.prepare([("scene", video)])
+
+    assert summary["batch_requests_generated"] == 1
+    plan = json.loads(pipeline.plan_path.read_text(encoding="utf-8"))
+    assert plan["batches"][0]["batch_id"] == "batch_0002"
+
+
+def test_submit_rejects_a_stale_pre_v3_plan(workspace_tmp_path, fake_client):
+    pipeline = make_pipeline(workspace_tmp_path, fake_client)
+    pipeline.plan_path.write_text(
+        json.dumps({
+            "model": "gemini-test",
+            "prompt_version": "road-vlm-v2",
+            "taxonomy_version": "road-v1",
+            "pipeline_version": "semantic-pipeline-v1",
+            "batches": [{"batch_id": "batch_0001"}],
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="not compatible.*Run prepare again"):
+        pipeline.submit()
+    fake_client.batches.create.assert_not_called()
+
+
 def test_submit_is_idempotent_for_active_jobs(workspace_tmp_path, fake_client, monkeypatch):
     pipeline = make_pipeline(workspace_tmp_path, fake_client)
     path = workspace_tmp_path / "data" / "scene" / "cam_front.mp4"

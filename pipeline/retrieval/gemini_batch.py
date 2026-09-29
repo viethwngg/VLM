@@ -248,6 +248,21 @@ class GeminiBatchPipeline:
             "pipeline_version": PIPELINE_VERSION,
         }
 
+    def _is_current_version(self, metadata: dict) -> bool:
+        """Return whether persisted Batch state belongs to this V3 contract."""
+        expected = self._version_metadata()
+        return all(metadata.get(key) == value for key, value in expected.items())
+
+    def _require_current_version(self, metadata: dict, label: str) -> None:
+        if self._is_current_version(metadata):
+            return
+        expected = self._version_metadata()
+        actual = {key: metadata.get(key) for key in expected}
+        raise RuntimeError(
+            f"{label} is not compatible with the current VLM V3 contract: "
+            f"expected {expected}, got {actual}. Run prepare again."
+        )
+
     def _sleep(self, attempt: int, label: str) -> None:
         base = min(60.0, self.retry_delay * (2 ** min(attempt, 10)))
         delay = min(60.0, base + random.uniform(0, base * 0.2))
@@ -341,6 +356,8 @@ class GeminiBatchPipeline:
         keys = set()
         for job_path in self.batch_root.glob("batch_*/batch_job.json"):
             job = _read_json(job_path, {})
+            if not self._is_current_version(job):
+                continue
             state = job.get("status")
             should_include = state in ACTIVE_JOB_STATES if active_only else True
             if job.get("job_name") and should_include:
@@ -552,6 +569,7 @@ class GeminiBatchPipeline:
         if not plan.get("batches"):
             LOGGER.info("[SUBMIT] no prepared batch requests")
             return []
+        self._require_current_version(plan, "Batch plan")
         jobs = [self._submit_batch(batch) for batch in plan["batches"]]
         self._write_root_job(jobs)
         return jobs
@@ -573,7 +591,14 @@ class GeminiBatchPipeline:
         _write_json(self.root_job_path, root)
 
     def _job_files(self) -> list[Path]:
-        return sorted(self.batch_root.glob("batch_*/batch_job.json"))
+        """Return only jobs created for the active model and V3 contract."""
+        paths = []
+        for path in sorted(self.batch_root.glob("batch_*/batch_job.json")):
+            if self._is_current_version(_read_json(path, {})):
+                paths.append(path)
+            else:
+                LOGGER.info("[SKIP] stale Batch job manifest=%s", path)
+        return paths
 
     def status(self) -> list[dict]:
         """Refresh and persist state for every submitted batch job."""
@@ -651,11 +676,17 @@ class GeminiBatchPipeline:
 
     def collect(self) -> dict:
         """Download successful output JSONL files and materialize scene metadata."""
-        prepare_manifest = _read_json(self.prepare_manifest_path, {})
-        failures_by_key = {
-            item.get("key"): item for item in _read_json(self.failed_path, []) if item.get("key")
+        prepare_manifest = {
+            key: value
+            for key, value in _read_json(self.prepare_manifest_path, {}).items()
+            if self._is_current_version(value)
         }
-        successful_keys = set(_read_json(self.successful_path, []))
+        failures_by_key = {
+            item.get("key"): item
+            for item in _read_json(self.failed_path, [])
+            if item.get("key") in prepare_manifest
+        }
+        successful_keys = set(_read_json(self.successful_path, [])) & set(prepare_manifest)
         succeeded = 0
         processed_jobs = 0
         latest_jobs = []
@@ -762,7 +793,7 @@ class GeminiBatchPipeline:
         if latest_jobs:
             self._write_root_job(latest_jobs)
         if succeeded:
-            build_corpus(self.output_root)
+            build_corpus(self.output_root, model=self.model)
         # Required stable aggregate path, while each split retains its own raw file.
         aggregate = self.batch_root / "batch_results_raw.jsonl"
         raw_files = [Path(data.get("raw_result", "")) for data in map(lambda p: _read_json(p, {}), self._job_files())]
@@ -786,7 +817,11 @@ class GeminiBatchPipeline:
     def retry_failed(self) -> list[dict]:
         """Create and submit new batches containing retryable failed keys only."""
         failures = _read_json(self.failed_path, [])
-        prepared = _read_json(self.prepare_manifest_path, {})
+        prepared = {
+            key: value
+            for key, value in _read_json(self.prepare_manifest_path, {}).items()
+            if self._is_current_version(value)
+        }
         submitted = self._submitted_keys(active_only=True)
         rows = []
         for failure in failures:
