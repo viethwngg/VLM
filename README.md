@@ -7,7 +7,7 @@ video → Gemini VLM → semantic metadata → searchable_text
       → Gemini Embedding 2 → vector 768D → FAISS IndexFlatIP → scene_id
 ```
 
-Metadata như agents, actions, locations, weather và events vẫn được lưu riêng để dùng cho metadata filter hoặc hybrid retrieval. Chỉ `searchable_text` được gửi tới embedding API; pipeline không embed JSON, đường dẫn file, timestamp hay provenance.
+Metadata lồng theo `scene`, `ego`, `agents`, `events` và `attention_events` vẫn được lưu riêng để dùng cho metadata filter hoặc hybrid retrieval. Chỉ `searchable_text` được gửi tới embedding API; pipeline không embed JSON, đường dẫn file, timestamp hay provenance.
 
 ## Thành phần chính
 
@@ -110,8 +110,9 @@ Mỗi dòng cần tối thiểu:
 {
   "scene_id": "scene-0061",
   "searchable_text": "Urban intersection. A pedestrian crosses while a car turns right.",
-  "agents": ["pedestrian", "car"],
-  "actions": ["crossing", "turning_right"]
+  "scene": {"road_type": "urban_road", "traffic_state": "moderate_traffic"},
+  "ego": {"actions": ["decelerating"]},
+  "agents": [{"type": "pedestrian", "actions": ["crossing"]}]
 }
 ```
 

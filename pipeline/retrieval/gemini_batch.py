@@ -25,8 +25,8 @@ from .gemini_vlm import (
     parse_scene_payload,
     response_text,
 )
-from .schemas import GeminiSceneOutput, SemanticScene
-from .semantic_pipeline import build_corpus, write_scene_metadata
+from .schemas import GeminiSceneOutput
+from .semantic_pipeline import build_corpus, is_current_scene_artifact, write_scene_metadata
 
 load_dotenv()
 LOGGER = logging.getLogger(__name__)
@@ -120,11 +120,7 @@ def _error_retryable(error) -> bool:
 def is_scene_completed(scene_id: str, output_root: str | Path) -> bool:
     """Return true only for an existing, schema-valid artifact for this scene."""
     path = Path(output_root) / scene_id / "semantic_metadata.json"
-    try:
-        scene = SemanticScene.model_validate_json(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return scene.scene_id == scene_id
+    return is_current_scene_artifact(path, scene_id)
 
 
 def make_batch_request(

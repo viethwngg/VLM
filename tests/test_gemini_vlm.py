@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,6 +11,23 @@ from pipeline.retrieval.gemini_vlm import GeminiVLM
 from pipeline.retrieval.schemas import GeminiSceneOutput
 
 
+VALID_OUTPUT = {
+    "scene": {
+        "road_type": "urban_road",
+        "traffic_state": "moderate_traffic",
+        "weather": "clear",
+        "lighting": "daylight",
+        "road_surface": "dry",
+    },
+    "ego": {"actions": ["decelerating"]},
+    "agents": [],
+    "events": [],
+    "attention_events": [],
+    "searchable_text": "Urban road with moderate traffic.",
+}
+VALID_TEXT = json.dumps(VALID_OUTPUT)
+
+
 @pytest.fixture
 def setup_vlm(monkeypatch):
     monkeypatch.setattr("pipeline.retrieval.gemini_vlm.time.sleep", Mock())
@@ -19,7 +37,7 @@ def setup_vlm(monkeypatch):
                              mime_type="video/mp4", state="ACTIVE")
     client = SimpleNamespace(
         files=SimpleNamespace(upload=Mock(return_value=remote), get=Mock(return_value=remote)),
-        models=SimpleNamespace(generate_content=Mock(return_value=SimpleNamespace(text='{}'))),
+        models=SimpleNamespace(generate_content=Mock(return_value=SimpleNamespace(text=VALID_TEXT))),
     )
     frames = [FrameSample("CAM_FRONT", timestamp, str(video)) for timestamp in (0, 1)]
     return GeminiVLM(client=client, max_retries=3, retry_delay=10, fallback_models=[]), client, frames, remote
@@ -88,7 +106,7 @@ def test_permanent_api_error_is_not_retried(setup_vlm):
 
 def test_generation_retry_reuses_uploaded_video(setup_vlm):
     vlm, client, frames, _ = setup_vlm
-    client.models.generate_content.side_effect = [httpx.RemoteProtocolError("Disconnected"), SimpleNamespace(text='{}')]
+    client.models.generate_content.side_effect = [httpx.RemoteProtocolError("Disconnected"), SimpleNamespace(text=VALID_TEXT)]
     vlm.analyze("scene-0061", frames)
     client.files.upload.assert_called_once()
     assert client.models.generate_content.call_count == 2
@@ -102,30 +120,40 @@ def test_generation_requests_structured_output(setup_vlm):
     assert config["response_schema"] is GeminiSceneOutput
 
 
-def test_legacy_string_events_and_relations_are_normalized(setup_vlm):
+def test_nested_taxonomy_labels_are_normalized(setup_vlm):
     vlm, client, frames, _ = setup_vlm
-    client.models.generate_content.return_value = SimpleNamespace(text='''{
-        "events": ["vehicle_turning", "vehicle_stopping"],
-        "relations": ["in_front_of", "following"]
-    }''')
+    payload = dict(VALID_OUTPUT)
+    payload["agents"] = [{
+        "type": "Pedestrian",
+        "actions": ["Crossing", "invented"],
+        "locations": ["Crosswalk"],
+        "relations": ["Crossing Ego Path"],
+    }]
+    payload["events"] = [{
+        "type": "Pedestrian Crossing",
+        "participants": ["Pedestrian"],
+        "location": "Crosswalk",
+        "temporal_transition": "Roadside To Crossing",
+    }]
+    client.models.generate_content.return_value = SimpleNamespace(text=json.dumps(payload))
     scene = vlm.analyze("scene-0061", frames)
-    assert [event.event for event in scene.events] == ["vehicle_turning", "vehicle_stopping"]
-    assert [relation.relation for relation in scene.relations] == ["in_front_of", "following"]
-    assert all(relation.subject == "unknown" and relation.object == "unknown"
-               for relation in scene.relations)
+    assert scene.agents[0].type == "pedestrian"
+    assert scene.agents[0].actions == ["crossing"]
+    assert scene.agents[0].relations == ["crossing_ego_path"]
+    assert scene.events[0].type == "pedestrian_crossing"
+    assert scene.events[0].temporal_transition == "roadside_to_crossing"
     client.models.generate_content.assert_called_once()
 
 
 def test_uses_sdk_parsed_structured_output(setup_vlm):
     vlm, client, frames, _ = setup_vlm
     parsed = GeminiSceneOutput(
-        description="A car turns.",
-        events=[{"event": "vehicle_turning", "agent": "car"}],
+        **VALID_OUTPUT,
     )
     client.models.generate_content.return_value = SimpleNamespace(parsed=parsed, text="ignored")
     scene = vlm.analyze("scene-0061", frames)
-    assert scene.description == "A car turns."
-    assert scene.events[0].event == "vehicle_turning"
+    assert scene.scene.road_type == "urban_road"
+    assert scene.ego.actions == ["decelerating"]
 
 
 @pytest.mark.parametrize("code", [400, 401, 403, 404])
@@ -145,7 +173,7 @@ def test_transient_generation_api_error_is_retried(setup_vlm, code):
     vlm, client, frames, _ = setup_vlm
     client.models.generate_content.side_effect = [
         errors.APIError(code, {"error": {"message": "Try again"}}),
-        SimpleNamespace(text='{}'),
+        SimpleNamespace(text=VALID_TEXT),
     ]
     assert vlm.analyze("scene-0061", frames).scene_id == "scene-0061"
     assert client.models.generate_content.call_count == 2
@@ -186,7 +214,7 @@ def test_overload_recovers_without_reupload(setup_vlm):
     client.models.generate_content.side_effect = [
         errors.ServerError(503, {"error": {"message": "High demand"}}),
         errors.ServerError(503, {"error": {"message": "High demand"}}),
-        SimpleNamespace(text='{}'),
+        SimpleNamespace(text=VALID_TEXT),
     ]
     assert vlm.analyze("scene-0061", frames).scene_id == "scene-0061"
     client.files.upload.assert_called_once()
@@ -209,7 +237,7 @@ def test_unavailable_model_falls_back_without_reupload(setup_vlm, code):
     vlm.models = [vlm.model, "fallback-model"]
     client.models.generate_content.side_effect = [
         errors.APIError(code, {"error": {"message": "Unavailable"}}),
-        SimpleNamespace(text='{}'),
+        SimpleNamespace(text=VALID_TEXT),
     ]
     scene = vlm.analyze("scene-0061", frames)
     assert scene.provenance.vlm_model == "fallback-model"

@@ -3,7 +3,7 @@ semantic:
   output_root: artifacts/semantic
   camera: CAM_FRONT
   num_frames: 8
-  prompt_version: road-vlm-v2
+  prompt_version: road-vlm-v3
 embedding:
   provider: gemini
   model: gemini-embedding-2

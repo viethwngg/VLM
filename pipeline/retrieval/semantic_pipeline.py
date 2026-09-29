@@ -3,9 +3,26 @@ import json, logging
 from pathlib import Path
 from .frame_sampler import sample_video
 from .gemini_vlm import GeminiVLM
+from .prompts import PROMPT_VERSION
+from .schemas import SemanticScene
 from .searchable_text import build_searchable_text
+from .taxonomy import TAXONOMY_VERSION
 
 LOGGER = logging.getLogger(__name__)
+
+
+def is_current_scene_artifact(path: str | Path, scene_id: str) -> bool:
+    """Accept resume output only when schema and semantic versions match."""
+    try:
+        scene = SemanticScene.model_validate_json(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        scene.scene_id == scene_id
+        and scene.provenance.prompt_version == PROMPT_VERSION
+        and scene.provenance.taxonomy_version == TAXONOMY_VERSION
+        and scene.provenance.pipeline_version == "semantic-pipeline-v2"
+    )
 
 
 def write_scene_metadata(scene, output_root: str | Path) -> Path:
@@ -21,15 +38,35 @@ def write_scene_metadata(scene, output_root: str | Path) -> Path:
 
 def process_scene(scene_id: str, video_path: str | Path, output_root: str | Path, camera="CAM_FRONT", num_frames=8, force=False, vlm=None) -> Path:
     out = Path(output_root) / scene_id / "semantic_metadata.json"
-    if out.exists() and not force: return out
+    if not force and is_current_scene_artifact(out, scene_id): return out
     frames = sample_video(video_path, camera, num_frames)
     evidence = [f.__dict__ for f in frames]
     scene = (vlm or GeminiVLM()).analyze(scene_id, frames, evidence)
     return write_scene_metadata(scene, output_root)
 
 def build_corpus(semantic_root: str | Path) -> Path:
-    root = Path(semantic_root); corpus = root / "semantic_corpus.jsonl"; rows = []
+    root = Path(semantic_root)
+    corpus = root / "semantic_corpus.jsonl"
+    rows = []
     for path in sorted(root.glob("*/semantic_metadata.json")):
-        data = json.loads(path.read_text(encoding="utf-8")); rows.append({k: data.get(k) for k in ("scene_id", "searchable_text", "agents", "actions", "locations", "events", "road_context", "weather", "time_of_day")})
-    corpus.write_text("".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
+        try:
+            scene = SemanticScene.model_validate_json(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("Skipping incompatible semantic artifact %s: %s", path, exc)
+            continue
+        data = scene.model_dump(mode="json")
+        rows.append({
+            key: data.get(key)
+            for key in (
+                "scene_id", "searchable_text", "scene", "ego", "agents",
+                "events", "attention_events",
+            )
+        })
+    corpus.write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
     return corpus

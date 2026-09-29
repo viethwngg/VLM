@@ -106,6 +106,29 @@ def frames(video="video.mp4"):
     ]
 
 
+def semantic_scene(scene_id):
+    return SemanticScene(
+        scene_id=scene_id,
+        scene={
+            "road_type": "urban_road",
+            "traffic_state": "moderate_traffic",
+            "weather": "clear",
+            "lighting": "daylight",
+            "road_surface": "dry",
+        },
+        ego={"actions": ["decelerating"]},
+        agents=[],
+        events=[],
+        attention_events=[],
+        searchable_text="Urban road with moderate traffic.",
+        provenance={
+            "vlm_model": "model",
+            "prompt_version": "road-vlm-v3",
+            "taxonomy_version": "road-v2",
+        },
+    )
+
+
 def test_batch_request_reuses_prompt_and_references_file_uri():
     row = make_batch_request(
         "scene-0001", frames(), file_uri="https://files.example/video", mime_type="video/mp4"
@@ -128,10 +151,7 @@ def test_batch_validation_rejects_duplicate_keys():
 
 def test_is_scene_completed_requires_valid_matching_schema(workspace_tmp_path):
     output = workspace_tmp_path / "semantic"
-    scene = SemanticScene(
-        scene_id="scene-1",
-        provenance={"vlm_model": "model", "prompt_version": "v", "taxonomy_version": "v"},
-    )
+    scene = semantic_scene("scene-1")
     write_scene_metadata(scene, output)
     assert is_scene_completed("scene-1", output)
     assert not is_scene_completed("scene-2", output)
@@ -148,10 +168,7 @@ def test_prepare_skips_completed_splits_and_persists_manifest(
         path.parent.mkdir(parents=True)
         path.write_bytes(b"video")
         jobs.append((f"scene-{index}", path))
-    completed = SemanticScene(
-        scene_id="scene-0",
-        provenance={"vlm_model": "model", "prompt_version": "v", "taxonomy_version": "v"},
-    )
+    completed = semantic_scene("scene-0")
     write_scene_metadata(completed, pipeline.output_root)
     monkeypatch.setattr(
         "pipeline.retrieval.gemini_batch.sample_video",
@@ -218,9 +235,28 @@ def test_download_uses_shared_schema_parser_and_writes_canonical_metadata(
         "response": {
             "candidates": [{
                 "content": {"parts": [{"text": json.dumps({
-                    "description": "A car turns.",
-                    "agents": ["car"],
-                    "actions": ["turning_right"],
+                    "scene": {
+                        "road_type": "urban_road",
+                        "traffic_state": "moderate_traffic",
+                        "weather": "clear",
+                        "lighting": "daylight",
+                        "road_surface": "dry",
+                    },
+                    "ego": {"actions": ["turning_right"]},
+                    "agents": [{
+                        "type": "car",
+                        "actions": ["turning_right"],
+                        "locations": ["intersection"],
+                        "relations": [],
+                    }],
+                    "events": [{
+                        "type": "vehicle_turning",
+                        "participants": ["car"],
+                        "location": "intersection",
+                        "temporal_transition": "straight_to_turning_right",
+                    }],
+                    "attention_events": [],
+                    "searchable_text": "A car turns right at an urban intersection.",
                 })}]}
             }]
         },
@@ -233,7 +269,9 @@ def test_download_uses_shared_schema_parser_and_writes_canonical_metadata(
     metadata = json.loads(output.read_text(encoding="utf-8"))
     assert metadata["scene_id"] == "scene"
     assert metadata["provenance"]["vlm_model"] == "gemini-test"
-    assert "Agents: car" in metadata["searchable_text"]
+    assert metadata["scene"]["road_type"] == "urban_road"
+    assert metadata["agents"][0]["type"] == "car"
+    assert metadata["searchable_text"] == "A car turns right at an urban intersection."
     assert pipeline.failed_path.read_text(encoding="utf-8").strip() == "[]"
 
 

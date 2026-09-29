@@ -8,6 +8,7 @@ from google.genai import errors
 from .prompts import PROMPT_VERSION, prompt_for_taxonomy
 from .schemas import GeminiSceneOutput, SemanticScene
 from .searchable_text import build_searchable_text
+from .taxonomy import TAXONOMY_VERSION
 
 load_dotenv()
 LOGGER = logging.getLogger(__name__)
@@ -65,8 +66,8 @@ def parse_scene_payload(
         "vlm_provider": "gemini",
         "vlm_model": model,
         "prompt_version": PROMPT_VERSION,
-        "taxonomy_version": "road-v1",
-        "pipeline_version": "semantic-pipeline-v1",
+        "taxonomy_version": TAXONOMY_VERSION,
+        "pipeline_version": "semantic-pipeline-v2",
     }
     scene = SemanticScene.model_validate(data)
     scene.searchable_text = build_searchable_text(scene)
