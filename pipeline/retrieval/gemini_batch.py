@@ -19,13 +19,16 @@ from google import genai
 from google.genai import errors, types
 
 from .frame_sampler import sample_video
-from .gemini_vlm import (
+from .prompts import PROMPT_VERSION
+from .taxonomy import TAXONOMY_VERSION
+from .vlm_contract import (
     DEFAULT_MODEL,
+    PIPELINE_VERSION,
+    batch_generation_config,
     build_scene_parts,
     parse_scene_payload,
     response_text,
 )
-from .schemas import GeminiSceneOutput
 from .semantic_pipeline import build_corpus, is_current_scene_artifact, write_scene_metadata
 
 load_dotenv()
@@ -39,6 +42,11 @@ ACTIVE_JOB_STATES = {
     "JOB_STATE_UPDATING",
 }
 SUCCESS_JOB_STATES = {"JOB_STATE_SUCCEEDED", "JOB_STATE_PARTIALLY_SUCCEEDED"}
+FAILED_JOB_STATES = {
+    "JOB_STATE_FAILED",
+    "JOB_STATE_CANCELLED",
+    "JOB_STATE_EXPIRED",
+}
 RETRYABLE_HTTP_CODES = {408, 429, 500, 502, 503, 504}
 VIDEO_MIME_TYPES = {
     ".avi": "video/x-msvideo",
@@ -117,31 +125,46 @@ def _error_retryable(error) -> bool:
     )
 
 
-def is_scene_completed(scene_id: str, output_root: str | Path) -> bool:
+def make_request_key(scene_id: str, camera: str) -> str:
+    """Build a deterministic response key without relying on batch position."""
+    if not scene_id or not scene_id.strip():
+        raise ValueError("scene_id must be non-empty")
+    if not camera or not camera.strip():
+        raise ValueError("camera must be non-empty")
+    return f"{scene_id}__{camera}"
+
+
+def is_scene_completed(
+    scene_id: str,
+    output_root: str | Path,
+    model: str | None = None,
+) -> bool:
     """Return true only for an existing, schema-valid artifact for this scene."""
     path = Path(output_root) / scene_id / "semantic_metadata.json"
-    return is_current_scene_artifact(path, scene_id)
+    return is_current_scene_artifact(path, scene_id, model)
 
 
 def make_batch_request(
     scene_id: str,
     frames: list,
     *,
+    camera: str | None = None,
     file_uri: str,
     mime_type: str,
 ) -> dict:
     """Create one documented file-based BatchGenerateContent JSONL row."""
+    resolved_camera = camera or (frames[0].camera if frames else None)
+    if resolved_camera is None:
+        raise ValueError("camera is required when frames are empty")
+    key = make_request_key(scene_id, resolved_camera)
     return {
-        "key": scene_id,
+        "key": key,
         "request": {
             "contents": [{
                 "role": "user",
                 "parts": build_scene_parts(scene_id, frames, file_uri, mime_type),
             }],
-            "generation_config": {
-                "response_mime_type": "application/json",
-                "response_json_schema": GeminiSceneOutput.model_json_schema(),
-            },
+            "generation_config": batch_generation_config(),
         },
     }
 
@@ -214,6 +237,16 @@ class GeminiBatchPipeline:
         self.root_requests_path = self.batch_root / "batch_requests.jsonl"
         self.root_job_path = self.batch_root / "batch_job.json"
         self.failed_path = self.batch_root / "failed_requests.json"
+        self.successful_path = self.batch_root / "successful_requests.json"
+        self.invalid_path = self.batch_root / "invalid_schema_requests.json"
+
+    def _version_metadata(self) -> dict:
+        return {
+            "model": self.model,
+            "prompt_version": PROMPT_VERSION,
+            "taxonomy_version": TAXONOMY_VERSION,
+            "pipeline_version": PIPELINE_VERSION,
+        }
 
     def _sleep(self, attempt: int, label: str) -> None:
         base = min(60.0, self.retry_delay * (2 ** min(attempt, 10)))
@@ -309,11 +342,7 @@ class GeminiBatchPipeline:
         for job_path in self.batch_root.glob("batch_*/batch_job.json"):
             job = _read_json(job_path, {})
             state = job.get("status")
-            should_include = (
-                state in ACTIVE_JOB_STATES
-                if active_only
-                else state not in {"JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"}
-            )
+            should_include = state in ACTIVE_JOB_STATES if active_only else True
             if job.get("job_name") and should_include:
                 keys.update(job.get("request_keys", []))
         return keys
@@ -348,7 +377,7 @@ class GeminiBatchPipeline:
             number += 1
         plan = {
             "kind": kind,
-            "model": self.model,
+            **self._version_metadata(),
             "batch_size": self.batch_size,
             "request_count": len(rows),
             "created_at": utc_now(),
@@ -365,12 +394,13 @@ class GeminiBatchPipeline:
         candidates: list[tuple[str, Path]] = []
         completed = 0
         for scene_id, video_path in jobs:
-            if not force and is_scene_completed(scene_id, self.output_root):
+            request_key = make_request_key(scene_id, self.camera)
+            if not force and is_scene_completed(scene_id, self.output_root, self.model):
                 completed += 1
                 LOGGER.info("[SKIP] %s already completed", scene_id)
                 continue
-            if scene_id in submitted:
-                LOGGER.info("[SKIP] %s already submitted", scene_id)
+            if request_key in submitted or scene_id in submitted:
+                LOGGER.info("[SKIP] %s already submitted", request_key)
                 continue
             candidates.append((scene_id, Path(video_path)))
             if limit is not None and len(candidates) >= limit:
@@ -380,17 +410,20 @@ class GeminiBatchPipeline:
         upload_failed = 0
         for scene_id, video_path in candidates:
             try:
-                upload = self.upload_video(scene_id, video_path, upload_manifest)
+                request_key = make_request_key(scene_id, self.camera)
+                upload = self.upload_video(request_key, video_path, upload_manifest)
                 frames = sample_video(video_path, self.camera, self.num_frames)
                 evidence = [frame.__dict__ for frame in frames]
                 row = make_batch_request(
                     scene_id,
                     frames,
+                    camera=self.camera,
                     file_uri=upload["file_uri"],
                     mime_type=upload["mime_type"],
                 )
                 rows.append(row)
-                prepare_manifest[scene_id] = {
+                prepare_manifest[request_key] = {
+                    "request_key": request_key,
                     "scene_id": scene_id,
                     "camera": self.camera,
                     "video_path": str(video_path.resolve()),
@@ -399,19 +432,21 @@ class GeminiBatchPipeline:
                     "mime_type": upload["mime_type"],
                     "evidence": evidence,
                     "request": row,
+                    **self._version_metadata(),
                     "prepared_at": utc_now(),
                 }
-                LOGGER.info("[BATCH] added %s", scene_id)
+                LOGGER.info("[BATCH] added %s", request_key)
             except Exception as exc:
                 upload_failed += 1
-                upload_manifest[scene_id] = {
+                request_key = make_request_key(scene_id, self.camera)
+                upload_manifest[request_key] = {
                     "local_path": str(video_path.resolve()),
                     "status": "ERROR",
                     "error": str(exc),
                     "updated_at": utc_now(),
                 }
                 _write_json(self.upload_manifest_path, upload_manifest)
-                LOGGER.error("[FAILED] %s upload/prepare error=%s", scene_id, exc)
+                LOGGER.error("[FAILED] %s upload/prepare error=%s", request_key, exc)
 
         _write_json(self.prepare_manifest_path, prepare_manifest)
         plan = self._create_plan(rows, kind="initial")
@@ -433,7 +468,7 @@ class GeminiBatchPipeline:
         return {
             **batch,
             "job_name": job.name,
-            "model": self.model,
+            **self._version_metadata(),
             "created_at": utc_now(),
             "input_file_name": input_file_name,
             "status": _state_name(job.state),
@@ -465,9 +500,13 @@ class GeminiBatchPipeline:
         if job_data.get("job_name"):
             _, job_data = self._refresh_job(job_data)
             _write_json(job_path, job_data)
-            if job_data["status"] in ACTIVE_JOB_STATES | SUCCESS_JOB_STATES:
-                LOGGER.info("[SKIP] %s existing job=%s state=%s", batch["batch_id"], job_data["job_name"], job_data["status"])
-                return job_data
+            LOGGER.info(
+                "[SKIP] %s existing job=%s state=%s",
+                batch["batch_id"],
+                job_data["job_name"],
+                job_data["status"],
+            )
+            return job_data
 
         input_file_name = job_data.get("input_file_name")
         if input_file_name:
@@ -488,7 +527,7 @@ class GeminiBatchPipeline:
             input_file_name = uploaded.name
             job_data = {
                 **batch,
-                "model": self.model,
+                **self._version_metadata(),
                 "input_file_name": input_file_name,
                 "status": "INPUT_UPLOADED",
                 "created_at": utc_now(),
@@ -520,10 +559,12 @@ class GeminiBatchPipeline:
     def _write_root_job(self, jobs: list[dict]) -> None:
         """Keep the stable root job manifest in sync with per-split state."""
         states = {job.get("status") for job in jobs}
+        existing = _read_json(self.root_job_path, {})
         root = {
             "job_name": jobs[0].get("job_name") if len(jobs) == 1 else None,
-            "model": self.model,
-            "created_at": utc_now(),
+            **self._version_metadata(),
+            "created_at": existing.get("created_at", utc_now()),
+            "updated_at": utc_now(),
             "request_count": sum(job.get("request_count", 0) for job in jobs),
             "input_jsonl": str(self.root_requests_path),
             "status": states.pop() if len(states) == 1 else "MULTIPLE",
@@ -559,36 +600,62 @@ class GeminiBatchPipeline:
             return destination.get("file_name") or destination.get("fileName")
         return getattr(destination, "file_name", None)
 
-    def _parse_result_line(self, line: dict, prepare_manifest: dict) -> tuple[str | None, dict | None]:
+    def _parse_result_line(
+        self,
+        line: dict,
+        prepare_manifest: dict,
+        *,
+        model: str,
+    ) -> tuple[str | None, dict | None]:
         key = line.get("key")
         if not key or key not in prepare_manifest:
-            return key, {"key": key, "error": "Unknown or missing request key", "retryable": False}
+            return key, {
+                "key": key,
+                "category": "mapping_failure",
+                "error": "Unknown or missing request key",
+                "retryable": False,
+            }
         error = line.get("error")
         response = line.get("response")
         if error or not response:
             detail = error or "Batch result has no response"
-            return key, {"key": key, "error": detail, "retryable": _error_retryable(detail)}
+            return key, {
+                "key": key,
+                "category": "api_failure",
+                "error": detail,
+                "retryable": _error_retryable(detail),
+            }
         try:
             prepared = prepare_manifest[key]
             scene = parse_scene_payload(
                 response_text(response),
                 scene_id=prepared["scene_id"],
                 evidence=prepared["evidence"],
-                model=self.model,
+                model=model,
             )
-            artifact = write_scene_metadata(scene, self.output_root)
-            LOGGER.info("[RESULT] %s success artifact=%s", key, artifact)
+            artifact = self.output_root / prepared["scene_id"] / "semantic_metadata.json"
+            if is_current_scene_artifact(artifact, prepared["scene_id"], model):
+                LOGGER.info("[RESULT] %s preserved existing artifact=%s", key, artifact)
+            else:
+                artifact = write_scene_metadata(scene, self.output_root)
+                LOGGER.info("[RESULT] %s success artifact=%s", key, artifact)
             return key, None
         except Exception as exc:
-            LOGGER.error("[FAILED] %s result parse error=%s", key, exc)
-            return key, {"key": key, "error": str(exc), "retryable": True}
+            LOGGER.error("[INVALID] %s V3 validation error=%s", key, exc)
+            return key, {
+                "key": key,
+                "category": "invalid_schema",
+                "error": str(exc),
+                "retryable": True,
+            }
 
-    def download(self) -> dict:
+    def collect(self) -> dict:
         """Download successful output JSONL files and materialize scene metadata."""
         prepare_manifest = _read_json(self.prepare_manifest_path, {})
         failures_by_key = {
             item.get("key"): item for item in _read_json(self.failed_path, []) if item.get("key")
         }
+        successful_keys = set(_read_json(self.successful_path, []))
         succeeded = 0
         processed_jobs = 0
         latest_jobs = []
@@ -598,6 +665,15 @@ class GeminiBatchPipeline:
                 continue
             job, data = self._refresh_job(data)
             if data["status"] not in SUCCESS_JOB_STATES:
+                if data["status"] in FAILED_JOB_STATES:
+                    for key in data.get("request_keys", []):
+                        failures_by_key[key] = {
+                            "key": key,
+                            "category": "api_failure",
+                            "error": f"Batch job ended in {data['status']}",
+                            "retryable": True,
+                        }
+                        successful_keys.discard(key)
                 _write_json(path, data)
                 latest_jobs.append(data)
                 LOGGER.info("[STATUS] %s not ready state=%s", data["job_name"], data["status"])
@@ -605,6 +681,14 @@ class GeminiBatchPipeline:
             result_name = self._result_file_name(job)
             if not result_name:
                 data["download_error"] = "Completed batch has no destination file"
+                for key in data.get("request_keys", []):
+                    failures_by_key[key] = {
+                        "key": key,
+                        "category": "api_failure",
+                        "error": data["download_error"],
+                        "retryable": True,
+                    }
+                    successful_keys.discard(key)
                 _write_json(path, data)
                 latest_jobs.append(data)
                 LOGGER.error("[FAILED] %s has no result file", data["job_name"])
@@ -619,23 +703,43 @@ class GeminiBatchPipeline:
             if downloaded is not None:
                 raw_path.write_bytes(downloaded)
             processed_jobs += 1
+            seen_keys: set[str] = set()
             for line_number, raw in enumerate(raw_path.read_text(encoding="utf-8").splitlines(), 1):
                 if not raw.strip():
                     continue
                 try:
                     line = json.loads(raw)
-                    key, failure = self._parse_result_line(line, prepare_manifest)
+                    key, failure = self._parse_result_line(
+                        line,
+                        prepare_manifest,
+                        model=data.get("model", self.model),
+                    )
+                    if key:
+                        seen_keys.add(key)
                 except Exception as exc:
-                    key, failure = None, {
-                        "key": None,
+                    key = f"{data['batch_id']}:{line_number}"
+                    failure = {
+                        "key": key,
+                        "category": "invalid_result",
                         "error": f"Invalid result JSONL line {line_number}: {exc}",
                         "retryable": False,
                     }
                 if failure:
-                    failures_by_key[key or f"{data['batch_id']}:{line_number}"] = failure
+                    failures_by_key[key] = failure
+                    if key:
+                        successful_keys.discard(key)
                 elif key:
                     failures_by_key.pop(key, None)
+                    successful_keys.add(key)
                     succeeded += 1
+            for missing_key in set(data.get("request_keys", [])) - seen_keys:
+                failures_by_key[missing_key] = {
+                    "key": missing_key,
+                    "category": "api_failure",
+                    "error": "Batch result omitted the request key",
+                    "retryable": True,
+                }
+                successful_keys.discard(missing_key)
             data.update({
                 "result_file_name": result_name,
                 "raw_result": str(raw_path),
@@ -646,6 +750,15 @@ class GeminiBatchPipeline:
 
         failures = list(failures_by_key.values())
         _write_json(self.failed_path, failures)
+        _write_json(self.successful_path, sorted(successful_keys))
+        _write_json(
+            self.invalid_path,
+            [
+                failure
+                for failure in failures
+                if failure.get("category") in {"invalid_schema", "invalid_result"}
+            ],
+        )
         if latest_jobs:
             self._write_root_job(latest_jobs)
         if succeeded:
@@ -661,7 +774,14 @@ class GeminiBatchPipeline:
             "jobs_downloaded": processed_jobs,
             "results_succeeded": succeeded,
             "results_failed": len(failures),
+            "invalid_schema": sum(
+                failure.get("category") == "invalid_schema" for failure in failures
+            ),
         }
+
+    def download(self) -> dict:
+        """Backward-compatible alias for :meth:`collect`."""
+        return self.collect()
 
     def retry_failed(self) -> list[dict]:
         """Create and submit new batches containing retryable failed keys only."""
@@ -673,7 +793,8 @@ class GeminiBatchPipeline:
             key = failure.get("key")
             if not failure.get("retryable") or key not in prepared:
                 continue
-            if is_scene_completed(key, self.output_root) or key in submitted:
+            scene_id = prepared[key]["scene_id"]
+            if is_scene_completed(scene_id, self.output_root, self.model) or key in submitted:
                 LOGGER.info("[SKIP] %s already completed/submitted", key)
                 continue
             rows.append(prepared[key]["request"])

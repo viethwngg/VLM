@@ -1,224 +1,26 @@
-"""Gemini adapter with bounded retries and shared response validation."""
-import json, logging, math, os, random, time
-from pathlib import Path
-import httpx
-from dotenv import load_dotenv
-from google import genai
-from google.genai import errors
-from .prompts import PROMPT_VERSION, prompt_for_taxonomy
-from .schemas import GeminiSceneOutput, SemanticScene
-from .searchable_text import build_searchable_text
-from .taxonomy import TAXONOMY_VERSION
+"""Deprecated compatibility exports for the removed synchronous VLM adapter.
 
-load_dotenv()
-LOGGER = logging.getLogger(__name__)
-DEFAULT_MODEL = "gemini-3.8-flash"
-DEFAULT_FALLBACK_MODELS = ("gemini-3.7-flash", "gemini-3.5-flash-lite")
+Semantic inference now runs exclusively through :mod:`gemini_batch`. Shared
+VLM V3 helpers remain importable from their historical module path so callers
+can migrate without prompt/schema drift.
+"""
 
+from .vlm_contract import (  # noqa: F401
+    DEFAULT_MODEL,
+    PIPELINE_VERSION,
+    batch_generation_config,
+    build_scene_parts,
+    build_scene_prompt,
+    parse_scene_payload,
+    response_text,
+)
 
-def build_scene_prompt(scene_id: str) -> str:
-    """Return the single versioned prompt used by sync and batch VLM calls."""
-    return prompt_for_taxonomy() + f"\nScene ID: {scene_id}\nReturn JSON only."
-
-
-def build_scene_parts(scene_id: str, frames: list, file_uri: str, mime_type: str) -> list[dict]:
-    """Build media and temporal context parts without duplicating prompt text."""
-    parts = [{"text": build_scene_prompt(scene_id)}]
-    parts.append({"file_data": {"file_uri": file_uri, "mime_type": mime_type}})
-    for frame in frames:
-        parts.append({
-            "text": (
-                f"Frame camera={frame.camera}, timestamp_s={frame.timestamp_s}, "
-                f"uri={frame.frame_uri}"
-            )
-        })
-    return parts
-
-
-def _json_object(raw: str) -> dict:
-    """Decode a model JSON response, tolerating a surrounding markdown fence."""
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("Gemini response does not contain a JSON object")
-    return json.loads(raw[start:end + 1])
-
-
-def parse_scene_payload(
-    payload,
-    *,
-    scene_id: str,
-    evidence: list[dict] | None,
-    model: str,
-) -> SemanticScene:
-    """Apply the existing metadata schema to either sync or batch output."""
-    if hasattr(payload, "model_dump"):
-        data = payload.model_dump()
-    elif isinstance(payload, dict):
-        data = dict(payload)
-    elif isinstance(payload, str):
-        data = _json_object(payload)
-    else:
-        raise TypeError(f"Unsupported Gemini payload type: {type(payload).__name__}")
-
-    data["scene_id"] = scene_id
-    data["evidence"] = evidence or data.get("evidence", [])
-    data["provenance"] = {
-        "vlm_provider": "gemini",
-        "vlm_model": model,
-        "prompt_version": PROMPT_VERSION,
-        "taxonomy_version": TAXONOMY_VERSION,
-        "pipeline_version": "semantic-pipeline-v2",
-    }
-    scene = SemanticScene.model_validate(data)
-    scene.searchable_text = build_searchable_text(scene)
-    return scene
-
-
-def response_text(response) -> str:
-    """Extract generated text from an SDK object or Batch API response dict."""
-    direct = getattr(response, "text", None) or getattr(response, "output_text", None)
-    if direct:
-        return direct
-    if isinstance(response, dict):
-        direct = response.get("text") or response.get("output_text")
-        if direct:
-            return direct
-        texts = []
-        for candidate in response.get("candidates", []):
-            for part in (candidate.get("content") or {}).get("parts", []):
-                if part.get("text"):
-                    texts.append(part["text"])
-        if texts:
-            return "".join(texts)
-    return str(response)
 
 class GeminiVLM:
-    def __init__(self, client=None, model: str | None = None, max_retries: int | None = None, processing_timeout: float = 300,
-                 retry_delay: float | None = None, fallback_models: list[str] | tuple[str, ...] | None = None):
-        max_retries = int(os.getenv("GEMINI_MAX_ATTEMPTS", "5")) if max_retries is None else max_retries
-        retry_delay = float(os.getenv("GEMINI_RETRY_DELAY_SECONDS", "10")) if retry_delay is None else retry_delay
-        if max_retries < 1 or processing_timeout <= 0:
-            raise ValueError("max_retries and processing_timeout must be positive")
-        if not math.isfinite(retry_delay) or retry_delay <= 0:
-            raise ValueError("retry_delay must be finite and positive")
-        self.model = model or os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
-        if fallback_models is None:
-            configured = os.getenv("GEMINI_FALLBACK_MODELS")
-            fallback_models = DEFAULT_FALLBACK_MODELS if configured is None else configured.split(",")
-        self.models = list(dict.fromkeys(
-            candidate.strip() for candidate in (self.model, *fallback_models) if candidate.strip()
-        ))
-        self.client = client or genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        self.max_retries = max_retries
-        self.processing_timeout = processing_timeout
-        self.retry_delay = retry_delay
+    """Compatibility guard for the retired synchronous execution class."""
 
-    def _retry_wait(self, attempt, scene_id):
-        # Cap the exponent and delay; jitter spreads concurrent callers apart.
-        base = min(60.0, self.retry_delay * (2 ** min(attempt, 10)))
-        delay = min(60.0, base + random.uniform(0, base * 0.2))
-        LOGGER.info("Retrying Gemini scene=%s in %.1fs", scene_id, delay)
-        time.sleep(delay)
-
-    def _file_request(self, operation, scene_id, **kwargs):
-        """Retry interrupted transfers and transient API failures only."""
-        for attempt in range(self.max_retries):
-            try:
-                return operation(**kwargs)
-            except (httpx.TransportError, errors.APIError) as exc:
-                if isinstance(exc, errors.APIError) and exc.code not in (408, 429, 500, 502, 503, 504):
-                    raise
-                LOGGER.warning("Gemini file request failed scene=%s attempt=%d/%d: %s",
-                               scene_id, attempt + 1, self.max_retries, exc)
-                if attempt + 1 == self.max_retries:
-                    raise RuntimeError(f"Gemini file request failed for {scene_id} after {self.max_retries} attempts") from exc
-                self._retry_wait(attempt, scene_id)
-
-    def _wait_for_file(self, remote, scene_id):
-        deadline = time.monotonic() + self.processing_timeout
-        while True:
-            state = getattr(remote, "state", None)
-            state = getattr(state, "name", state)
-            if state == "ACTIVE":
-                return remote
-            if state == "FAILED":
-                raise RuntimeError(f"Gemini video processing failed for {scene_id}: {remote.name}")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"Gemini video processing timed out for {scene_id}: {remote.name}")
-            LOGGER.info("Waiting for Gemini video processing scene=%s file=%s", scene_id, remote.name)
-            time.sleep(min(2, remaining))
-            remote = self._file_request(self.client.files.get, scene_id, name=remote.name)
-
-    def analyze(self, scene_id: str, frames: list, evidence: list[dict] | None = None) -> SemanticScene:
-        contents = [{"text": build_scene_prompt(scene_id)}]
-        uploaded = set()
-        for frame in frames:
-            uri = str(frame.frame_uri)
-            # Real Gemini clients need a Files API object for local media. Mock
-            # clients used by tests may not expose ``files``; retain metadata
-            # text in that case so the adapter remains independently testable.
-            if hasattr(self.client, "files") and Path(uri).exists() and uri not in uploaded:
-                remote = self._file_request(self.client.files.upload, scene_id, file=uri)
-                remote = self._wait_for_file(remote, scene_id)
-                contents.append({
-                    "file_data": {
-                        "file_uri": remote.uri,
-                        "mime_type": getattr(remote, "mime_type", "video/mp4"),
-                    }
-                })
-                uploaded.add(uri)
-            contents.append({
-                "text": f"Frame camera={frame.camera}, timestamp_s={frame.timestamp_s}, uri={frame.frame_uri}"
-            })
-        last_error = None
-        model_index = 0
-        for attempt in range(self.max_retries):
-            active_model = self.models[model_index]
-            try:
-                response = self.client.models.generate_content(model=active_model, contents=contents, config={
-                    "response_mime_type": "application/json",
-                    "response_schema": GeminiSceneOutput,
-                    "automatic_function_calling": {"disable": True},
-                })
-                parsed = getattr(response, "parsed", None)
-                payload = parsed if parsed is not None else response_text(response)
-                return parse_scene_payload(
-                    payload,
-                    scene_id=scene_id,
-                    evidence=evidence,
-                    model=active_model,
-                )
-            except Exception as exc:
-                can_switch_model = (
-                    isinstance(exc, errors.APIError)
-                    and exc.code in (404, 503)
-                    and len(self.models) > 1
-                )
-                if (isinstance(exc, errors.APIError)
-                        and exc.code not in (408, 429, 500, 502, 503, 504)
-                        and not can_switch_model):
-                    raise RuntimeError(
-                        f"Gemini failed for {scene_id} with model {active_model} "
-                        f"(HTTP {exc.code}). Check GEMINI_MODEL and API access. {exc}"
-                    ) from exc
-                last_error = exc
-                LOGGER.warning("VLM failure scene=%s model=%s attempt=%d/%d: %s",
-                               scene_id, active_model, attempt + 1, self.max_retries, exc)
-                if attempt + 1 < self.max_retries:
-                    if can_switch_model:
-                        previous_index = model_index
-                        model_index = (model_index + 1) % len(self.models)
-                        LOGGER.info("Switching Gemini model scene=%s from=%s to=%s",
-                                    scene_id, active_model, self.models[model_index])
-                        if model_index <= previous_index:
-                            self._retry_wait(attempt // len(self.models), scene_id)
-                    else:
-                        self._retry_wait(attempt, scene_id)
-        detail = ""
-        if isinstance(last_error, errors.APIError) and last_error.code == 503:
-            detail = " Gemini is temporarily unavailable (HTTP 503). Retry later or configure GEMINI_FALLBACK_MODELS."
+    def __init__(self, *args, **kwargs):
         raise RuntimeError(
-            f"Gemini failed for {scene_id} after {self.max_retries} attempts "
-            f"using {', '.join(self.models)}.{detail}"
-        ) from last_error
+            "Synchronous Gemini VLM inference was removed. "
+            "Use GeminiBatchPipeline or scripts/run_semantic_pipeline.py."
+        )

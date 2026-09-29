@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .taxonomy import TAXONOMY_VERSION, allowed, normalize_label
 
 
+SEMANTIC_PIPELINE_VERSION = "semantic-pipeline-v2"
+
+
 def _labels(field: str, values: Any) -> list[str]:
     if values is None:
         return []
@@ -148,7 +151,7 @@ class Provenance(BaseModel):
     vlm_model: str
     prompt_version: str
     taxonomy_version: str = TAXONOMY_VERSION
-    pipeline_version: str = "semantic-pipeline-v2"
+    pipeline_version: str = SEMANTIC_PIPELINE_VERSION
 
 
 class SemanticScene(SceneContent):

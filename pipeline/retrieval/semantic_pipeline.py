@@ -1,17 +1,20 @@
-"""Scene-level semantic extraction and JSONL export."""
+"""Validated semantic artifact persistence and corpus export."""
 import json, logging
 from pathlib import Path
-from .frame_sampler import sample_video
-from .gemini_vlm import GeminiVLM
 from .prompts import PROMPT_VERSION
 from .schemas import SemanticScene
 from .searchable_text import build_searchable_text
 from .taxonomy import TAXONOMY_VERSION
+from .vlm_contract import PIPELINE_VERSION
 
 LOGGER = logging.getLogger(__name__)
 
 
-def is_current_scene_artifact(path: str | Path, scene_id: str) -> bool:
+def is_current_scene_artifact(
+    path: str | Path,
+    scene_id: str,
+    model: str | None = None,
+) -> bool:
     """Accept resume output only when schema and semantic versions match."""
     try:
         scene = SemanticScene.model_validate_json(Path(path).read_text(encoding="utf-8"))
@@ -21,7 +24,8 @@ def is_current_scene_artifact(path: str | Path, scene_id: str) -> bool:
         scene.scene_id == scene_id
         and scene.provenance.prompt_version == PROMPT_VERSION
         and scene.provenance.taxonomy_version == TAXONOMY_VERSION
-        and scene.provenance.pipeline_version == "semantic-pipeline-v2"
+        and scene.provenance.pipeline_version == PIPELINE_VERSION
+        and (model is None or scene.provenance.vlm_model == model)
     )
 
 
@@ -35,14 +39,6 @@ def write_scene_metadata(scene, output_root: str | Path) -> Path:
         encoding="utf-8",
     )
     return out
-
-def process_scene(scene_id: str, video_path: str | Path, output_root: str | Path, camera="CAM_FRONT", num_frames=8, force=False, vlm=None) -> Path:
-    out = Path(output_root) / scene_id / "semantic_metadata.json"
-    if not force and is_current_scene_artifact(out, scene_id): return out
-    frames = sample_video(video_path, camera, num_frames)
-    evidence = [f.__dict__ for f in frames]
-    scene = (vlm or GeminiVLM()).analyze(scene_id, frames, evidence)
-    return write_scene_metadata(scene, output_root)
 
 def build_corpus(semantic_root: str | Path) -> Path:
     root = Path(semantic_root)

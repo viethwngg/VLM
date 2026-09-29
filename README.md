@@ -3,7 +3,7 @@
 RAV-21 biến video camera hành trình thành metadata ROAD++-inspired, tạo `searchable_text`, sinh Gemini embedding và lập chỉ mục FAISS để truy hồi scene theo ngữ nghĩa.
 
 ```text
-video → Gemini VLM → semantic metadata → searchable_text
+video → Gemini Batch VLM V3 → semantic metadata → searchable_text
       → Gemini Embedding 2 → vector 768D → FAISS IndexFlatIP → scene_id
 ```
 
@@ -11,11 +11,12 @@ Metadata lồng theo `scene`, `ego`, `agents`, `events` và `attention_events` v
 
 ## Thành phần chính
 
-- `pipeline/retrieval/gemini_vlm.py`: phân tích video và sinh structured metadata.
+- `pipeline/retrieval/vlm_contract.py`: nguồn duy nhất cho prompt/schema/config/validation VLM V3.
+- `pipeline/retrieval/gemini_batch.py`: upload, submit, status, collect và retry Gemini Batch.
 - `pipeline/retrieval/embedder.py`: Gemini Embedding 2, retry, validation và cache/resume.
 - `pipeline/retrieval/faiss_index.py`: kiểm tra artifact và xây `IndexFlatIP`.
 - `pipeline/retrieval/vector_search.py`: embed query, tìm top-K và map FAISS ID về `scene_id`.
-- `scripts/run_semantic_pipeline.py`: quét và xử lý toàn bộ video theo scene.
+- `scripts/run_semantic_pipeline.py`: CLI chính cho semantic pipeline Batch-only.
 - `scripts/build_embeddings.py`: tạo/cập nhật embedding corpus.
 - `scripts/build_faiss_index.py`: xây FAISS index.
 - `scripts/search.py`: tìm kiếm vector từ command line.
@@ -120,57 +121,59 @@ Mỗi dòng cần tối thiểu:
 
 ### Gemini VLM Batch Processing
 
-Batch mode dùng Gemini Developer API (`GEMINI_API_KEY`), không dùng Vertex AI.
-Sync command hiện tại vẫn là workflow mặc định và không bị thay đổi. Cấu hình
-batch tùy chọn: `GEMINI_MODEL`, `VLM_BATCH_SIZE` (mặc định `100`) và
-`VLM_BATCH_DIR` (mặc định `artifacts/vlm_batch`).
+Semantic VLM chỉ dùng Gemini Batch API với prompt `road-vlm-v3`; không còn gọi
+VLM đồng bộ theo từng scene. Pipeline dùng Gemini Developer API
+(`GEMINI_API_KEY`), không dùng Vertex AI. Cấu hình tùy chọn:
+`GEMINI_MODEL`, `VLM_BATCH_SIZE` (mặc định `100`) và `VLM_BATCH_DIR`
+(mặc định `artifacts/vlm_batch`).
 
 PowerShell:
 
 ```powershell
 $env:GEMINI_API_KEY="YOUR_KEY"
-python .\scripts\run_vlm_batch.py prepare --limit 3
-python .\scripts\run_vlm_batch.py submit
-python .\scripts\run_vlm_batch.py status
-python .\scripts\run_vlm_batch.py download
+python .\scripts\run_semantic_pipeline.py prepare --limit 3
+python .\scripts\run_semantic_pipeline.py submit
+python .\scripts\run_semantic_pipeline.py status
+python .\scripts\run_semantic_pipeline.py collect
 ```
 
 Linux/macOS:
 
 ```bash
 export GEMINI_API_KEY=YOUR_KEY
-python scripts/run_vlm_batch.py prepare --limit 3
-python scripts/run_vlm_batch.py submit
-python scripts/run_vlm_batch.py status
-python scripts/run_vlm_batch.py download
+python scripts/run_semantic_pipeline.py prepare --limit 3
+python scripts/run_semantic_pipeline.py submit
+python scripts/run_semantic_pipeline.py status
+python scripts/run_semantic_pipeline.py collect
 ```
 
 Full dataset:
 
 ```bash
-python scripts/run_vlm_batch.py prepare
-python scripts/run_vlm_batch.py submit
+python scripts/run_semantic_pipeline.py run
 ```
 
-Sau khi job hoàn tất, download kết quả rồi retry riêng các request lỗi tạm thời:
+Sau khi job hoàn tất, collect kết quả rồi retry riêng các request lỗi hoặc sai schema:
 
 ```bash
-python scripts/run_vlm_batch.py status
-python scripts/run_vlm_batch.py download
-python scripts/run_vlm_batch.py retry-failed
+python scripts/run_semantic_pipeline.py status
+python scripts/run_semantic_pipeline.py collect
+python scripts/run_semantic_pipeline.py retry
 ```
 
 `run` chỉ thực hiện `prepare -> submit` rồi thoát; nó không giữ terminal để
 poll hàng giờ. Upload manifest, batch job, raw results và failed requests được
-lưu dưới `artifacts/vlm_batch/`. Scene đã có `semantic_metadata.json` hợp lệ sẽ
-được bỏ qua; mỗi split `batch_0001`, `batch_0002`, ... có JSONL và job state
-riêng. Sau `download`, metadata vẫn dùng schema và đường dẫn cũ, rồi semantic
+lưu dưới `artifacts/vlm_batch/`. Scene đã có `semantic_metadata.json` V3 hợp lệ
+cho model hiện tại sẽ được bỏ qua; mỗi split `batch_0001`, `batch_0002`, ... có
+JSONL và job state riêng. Sau `collect`, metadata vẫn dùng schema và đường dẫn cũ, rồi semantic
 corpus được rebuild để embedding pipeline hiện tại tiếp tục hoạt động.
+
+`scripts/run_vlm_batch.py` chỉ còn là wrapper tương thích gọi cùng CLI này.
 
 ### 1. Tạo semantic metadata
 
-Chạy không có tham số sẽ tự động quét đệ quy và xử lý toàn bộ video trong
-`data/`:
+Chạy không có tham số tương đương `run`: prepare và submit rồi thoát, không chờ
+job hoàn tất:
 
 ```powershell
 python .\scripts\run_semantic_pipeline.py
@@ -204,18 +207,10 @@ python .\scripts\run_semantic_pipeline.py --scene-id scene-0061 --force
 - `_path_id(path)`: chuyển đường dẫn tương đối thành ID ổn định dùng làm tên thư
   mục artifact. Nếu một thư mục có nhiều video, tên video được nối vào ID để
   các kết quả không ghi đè lên nhau.
-- `process_scene_with_timing(...)`: chạy `process_scene()` cho một video, đồng
-  thời ghi log thời điểm bắt đầu, trạng thái, đường dẫn video, thời gian xử lý
-  và artifact đầu ra.
-- `format_duration(elapsed_s)`: định dạng thời gian chạy thành
-  `HH:MM:SS.mmm` để hiển thị trong log.
-- `log_total_duration(...)`: tính và ghi log tổng thời gian chạy của toàn bộ
-  batch, kèm tổng số scene, số scene thành công, số scene thất bại và đường dẫn
-  semantic corpus.
-- `main()`: đọc `config/retrieval.yaml`, tìm toàn bộ video, xử lý tuần tự từng
-  video và tạo lại `semantic_corpus.jsonl`. Nếu một video lỗi, runner ghi lỗi
-  rồi tiếp tục với các video còn lại; sau cùng trả exit code `1` nếu có ít nhất
-  một video thất bại.
+- `build_pipeline(...)`: đọc config và tạo Batch pipeline dùng chung cho mọi stage.
+- `main()`: điều phối độc lập các stage `prepare`, `submit`, `status`, `collect`,
+  `retry` và `run`. Job ID/manifest được lưu ngay sau submit để tiếp tục sau khi
+  process hoặc máy bị restart.
 
 Quy tắc tạo `scene_id`:
 
@@ -225,7 +220,7 @@ Quy tắc tạo `scene_id`:
   `scene-0061__cam_front` và `scene-0061__cam_back`.
 - Video nằm trực tiếp trong `data/`: dùng tên file không có phần mở rộng.
 
-Mặc định artifact đã tồn tại sẽ được bỏ qua. Dùng `--force` để phân tích lại.
+Mặc định artifact V3 hợp lệ với model hiện tại sẽ được bỏ qua. Dùng `--force` để chuẩn bị lại.
 `--all` vẫn được giữ để tương thích và có cùng hành vi với chạy không tham số.
 
 ### 2. Tạo Gemini embedding
@@ -385,8 +380,8 @@ python .\scripts\smoke_test_embeddings.py
 ## Giới hạn hiện tại
 
 - Vector search CLI chưa kết hợp metadata filter thành một hybrid ranking command duy nhất.
-- Scene được xử lý tuần tự ở semantic pipeline.
+- Bước upload/prepare local hiện chạy tuần tự; suy luận VLM chạy bằng Gemini Batch.
 - Chưa có benchmark định lượng cho retrieval quality.
-- Cache Gemini Files API chưa được chia sẻ giữa các lần chạy VLM.
+- File Gemini hết hạn sẽ được kiểm tra và upload lại khi prepare.
 
 Thông tin truy cập dataset trên Google Cloud nằm trong [ggcloud_readme.md](ggcloud_readme.md).

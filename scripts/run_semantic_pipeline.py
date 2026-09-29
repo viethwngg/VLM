@@ -1,28 +1,35 @@
+"""Primary CLI for the resumable Gemini Batch-only semantic pipeline."""
+
+from __future__ import annotations
+
 import argparse
 import logging
-import time
+import os
+import sys
 from collections import Counter
 from pathlib import Path
-import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import yaml
 
-from pipeline.retrieval.semantic_pipeline import build_corpus, process_scene
+from pipeline.retrieval.gemini_batch import GeminiBatchPipeline
+from pipeline.retrieval.prompts import PROMPT_VERSION
 
 
 LOGGER = logging.getLogger(__name__)
 VIDEO_EXTENSIONS = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
-
-
-def format_duration(elapsed_s: float) -> str:
-    """Format elapsed seconds as HH:MM:SS.mmm for human-readable logs."""
-    total_ms = round(elapsed_s * 1000)
-    hours, remainder = divmod(total_ms, 3_600_000)
-    minutes, remainder = divmod(remainder, 60_000)
-    seconds, milliseconds = divmod(remainder, 1000)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+COMMANDS = (
+    "prepare",
+    "submit",
+    "status",
+    "collect",
+    "retry",
+    "run",
+    # Backward-compatible aliases from run_vlm_batch.py.
+    "download",
+    "retry-failed",
+)
 
 
 def _path_id(path: Path) -> str:
@@ -33,13 +40,7 @@ def _path_id(path: Path) -> str:
 def discover_video_jobs(
     data_root: str | Path, scene_id: str | None = None
 ) -> list[tuple[str, Path]]:
-    """Find every video below data_root and assign a unique scene ID to it.
-
-    A directory containing one video keeps its directory name as the scene ID
-    (for example ``scene-0061/cam_front.mp4`` becomes ``scene-0061``). When a
-    directory contains multiple videos, the video stem is appended so that no
-    semantic artifact can overwrite or skip another video.
-    """
+    """Find every video below data_root and assign a unique scene ID to it."""
     root = Path(data_root)
     if not root.exists():
         raise FileNotFoundError(f"Data directory not found: {root}")
@@ -74,115 +75,130 @@ def discover_video_jobs(
     return jobs
 
 
-def process_scene_with_timing(
-    scene_id, video_path, output_root, camera, num_frames, force=False
-):
-    """Process one scene and log its complete wall-clock processing time."""
-    started = time.perf_counter()
-    LOGGER.info("scene_id=%s status=started video=%s", scene_id, video_path)
-    try:
-        artifact = process_scene(
-            scene_id, video_path, output_root, camera, num_frames, force
-        )
-    except Exception as exc:
-        elapsed_s = time.perf_counter() - started
-        LOGGER.error(
-            "scene_id=%s status=failed elapsed_s=%.3f duration=%s error=%s",
-            scene_id,
-            elapsed_s,
-            format_duration(elapsed_s),
-            exc,
-        )
-        raise
-
-    elapsed_s = time.perf_counter() - started
-    LOGGER.info(
-        "scene_id=%s status=success elapsed_s=%.3f duration=%s artifact=%s",
-        scene_id,
-        elapsed_s,
-        format_duration(elapsed_s),
-        artifact,
-    )
-    return artifact
-
-
-def log_total_duration(
-    started_at: float,
-    total: int,
-    succeeded: int,
-    failed: int,
-    corpus_path: str | Path,
-) -> float:
-    """Log the total wall-clock time for a complete VLM batch."""
-    elapsed_s = time.perf_counter() - started_at
-    LOGGER.info(
-        "pipeline_complete total=%d succeeded=%d failed=%d "
-        "elapsed_s=%.3f duration=%s corpus=%s",
-        total,
-        succeeded,
-        failed,
-        elapsed_s,
-        format_duration(elapsed_s),
-        corpus_path,
-    )
-    return elapsed_s
-
-
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run Gemini VLM over every video under the configured data directory."
+        description="Prepare and manage resumable Gemini Batch VLM V3 jobs."
     )
     parser.add_argument(
-        "--scene-id",
-        help="Process only a matching scene directory, generated scene ID, or video stem.",
+        "command",
+        nargs="?",
+        default="run",
+        choices=COMMANDS,
+        help="Batch lifecycle stage (default: run, which prepares and submits).",
+    )
+    parser.add_argument("--limit", type=int, help="Prepare at most N uncompleted videos")
+    parser.add_argument(
+        "--scene-id", help="Filter by scene directory, generated scene ID, or video stem"
     )
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Process all videos (this is also the default when --scene-id is omitted).",
+        help="Process all videos (default when --scene-id is omitted)",
     )
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Compatibility flag; Batch lifecycle commands are always resumable",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Include valid current V3 outputs"
+    )
+    parser.add_argument("--batch-size", type=int, help="Requests per batch split")
+    parser.add_argument("--batch-dir", type=Path, help="Batch artifact directory")
+    parser.add_argument(
+        "--model", help="Gemini model; defaults to GEMINI_MODEL/current configured model"
+    )
+    return parser
 
-    logging.basicConfig(level=logging.INFO)
-    root = Path(__file__).resolve().parents[1]
-    cfg = yaml.safe_load((root / "config/retrieval.yaml").read_text())
-    data_root = root / cfg["semantic"]["data_root"]
-    output = root / cfg["semantic"]["output_root"]
-    jobs = discover_video_jobs(data_root, args.scene_id)
 
+def build_pipeline(args, root: Path, config: dict) -> GeminiBatchPipeline:
+    semantic = config["semantic"]
+    batch_dir = args.batch_dir or Path(os.getenv("VLM_BATCH_DIR", "artifacts/vlm_batch"))
+    if not batch_dir.is_absolute():
+        batch_dir = root / batch_dir
+    return GeminiBatchPipeline(
+        data_root=root / semantic["data_root"],
+        output_root=root / semantic["output_root"],
+        batch_root=batch_dir,
+        camera=semantic["camera"],
+        num_frames=semantic["num_frames"],
+        model=args.model,
+        batch_size=args.batch_size,
+    )
+
+
+def _print_prepare(summary: dict) -> None:
+    labels = (
+        ("Total videos discovered", "total_videos_discovered"),
+        ("Already completed", "already_completed"),
+        ("Need processing", "need_processing"),
+        ("Upload successful", "upload_successful"),
+        ("Upload failed", "upload_failed"),
+        ("Batch requests generated", "batch_requests_generated"),
+        ("Batch files generated", "batch_count"),
+    )
+    for label, key in labels:
+        print(f"{label}: {summary[key]}")
+
+
+def _print_jobs(jobs: list[dict]) -> None:
     if not jobs:
-        target = f" matching {args.scene_id!r}" if args.scene_id else ""
-        parser.error(f"no videos found{target} under {data_root}")
+        print("No batch jobs.")
+        return
+    for job in jobs:
+        print(f"Batch: {job.get('job_name', job.get('batch_id'))}")
+        print(f"State: {job.get('status')}")
+        print(f"Requests: {job.get('request_count', 0)}")
+        print(f"Succeeded: {job.get('successful')}")
+        print(f"Failed: {job.get('failed')}")
 
-    LOGGER.info("discovered_videos=%d data_root=%s", len(jobs), data_root)
-    pipeline_started = time.perf_counter()
-    succeeded = 0
-    failed = 0
-    for video_scene_id, video_path in jobs:
-        try:
-            process_scene_with_timing(
-                video_scene_id,
-                video_path,
-                output,
-                cfg["semantic"]["camera"],
-                cfg["semantic"]["num_frames"],
-                args.force,
-            )
-            succeeded += 1
-        except Exception:
-            failed += 1
 
-    build_corpus(output)
-    log_total_duration(
-        pipeline_started,
-        len(jobs),
-        succeeded,
-        failed,
-        output / "semantic_corpus.jsonl",
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be positive")
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    root = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load(
+        (root / "config/retrieval.yaml").read_text(encoding="utf-8")
     )
-    return 1 if failed else 0
+    pipeline = build_pipeline(args, root, config)
+    command = {
+        "download": "collect",
+        "retry-failed": "retry",
+    }.get(args.command, args.command)
+
+    LOGGER.info("[VLM] prompt version: %s", PROMPT_VERSION)
+    LOGGER.info("[VLM] model: %s", pipeline.model)
+    LOGGER.info("[VLM] execution mode: Gemini Batch API")
+
+    if command in {"prepare", "run"}:
+        jobs = discover_video_jobs(pipeline.data_root, args.scene_id)
+        if not jobs:
+            parser.error(f"no matching videos found under {pipeline.data_root}")
+        LOGGER.info("[PREPARE] scenes/videos discovered: %d", len(jobs))
+        summary = pipeline.prepare(jobs, limit=args.limit, force=args.force)
+        _print_prepare(summary)
+        if command == "prepare":
+            return 1 if summary["upload_failed"] else 0
+        submitted = pipeline.submit()
+        _print_jobs(submitted)
+        return 1 if summary["upload_failed"] else 0
+
+    if command == "submit":
+        _print_jobs(pipeline.submit())
+    elif command == "status":
+        _print_jobs(pipeline.status())
+    elif command == "collect":
+        summary = pipeline.collect()
+        for key, value in summary.items():
+            print(f"{key.replace('_', ' ').title()}: {value}")
+        return 1 if summary["results_failed"] else 0
+    elif command == "retry":
+        _print_jobs(pipeline.retry_failed())
+    return 0
 
 
 if __name__ == "__main__":

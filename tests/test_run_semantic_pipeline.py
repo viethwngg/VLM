@@ -1,6 +1,6 @@
-import logging
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -17,14 +17,6 @@ def workspace_tmp_path():
         yield root
     finally:
         shutil.rmtree(root, ignore_errors=True)
-
-
-@pytest.mark.parametrize(
-    ("elapsed_s", "expected"),
-    [(19.124, "00:00:19.124"), (61.005, "00:01:01.005"), (3661.999, "01:01:01.999")],
-)
-def test_format_duration(elapsed_s, expected):
-    assert run_semantic_pipeline.format_duration(elapsed_s) == expected
 
 
 def test_discover_video_jobs_finds_every_supported_video(workspace_tmp_path):
@@ -73,61 +65,57 @@ def test_discover_video_jobs_finds_nested_and_root_videos(workspace_tmp_path):
     ]
 
 
-def test_process_scene_logs_elapsed_time(monkeypatch, caplog):
-    artifact = Path("artifacts/semantic/scene-0061/semantic_metadata.json")
-    process = Mock(return_value=artifact)
-    monkeypatch.setattr(run_semantic_pipeline, "process_scene", process)
-    monkeypatch.setattr(
-        run_semantic_pipeline.time, "perf_counter", Mock(side_effect=[100.0, 119.124])
+def test_main_run_prepares_and_submits_batch_only(monkeypatch, workspace_tmp_path):
+    video = workspace_tmp_path / "scene" / "cam_front.mp4"
+    video.parent.mkdir()
+    video.touch()
+    pipeline = SimpleNamespace(
+        data_root=workspace_tmp_path,
+        model="gemini-test",
+        prepare=Mock(return_value={
+            "total_videos_discovered": 1,
+            "already_completed": 0,
+            "need_processing": 1,
+            "upload_successful": 1,
+            "upload_failed": 0,
+            "batch_requests_generated": 1,
+            "batch_count": 1,
+        }),
+        submit=Mock(return_value=[]),
     )
+    monkeypatch.setattr(run_semantic_pipeline, "build_pipeline", Mock(return_value=pipeline))
 
-    with caplog.at_level(logging.INFO):
-        result = run_semantic_pipeline.process_scene_with_timing(
-            "scene-0061", "video.mp4", "output", "CAM_FRONT", 8
-        )
-
-    assert result == artifact
-    assert "status=started" in caplog.text
-    assert "elapsed_s=19.124" in caplog.text
-    assert "duration=00:00:19.124" in caplog.text
+    assert run_semantic_pipeline.main(["run"]) == 0
+    pipeline.prepare.assert_called_once()
+    pipeline.submit.assert_called_once()
 
 
-def test_process_scene_logs_failure_time(monkeypatch, caplog):
-    monkeypatch.setattr(
-        run_semantic_pipeline, "process_scene", Mock(side_effect=RuntimeError("failed"))
+@pytest.mark.parametrize(
+    ("command", "method"),
+    [("submit", "submit"), ("status", "status"), ("retry", "retry_failed")],
+)
+def test_individual_lifecycle_commands(monkeypatch, command, method):
+    pipeline = SimpleNamespace(data_root=Path("data"), model="gemini-test")
+    operation = Mock(return_value=[])
+    setattr(pipeline, method, operation)
+    monkeypatch.setattr(run_semantic_pipeline, "build_pipeline", Mock(return_value=pipeline))
+
+    assert run_semantic_pipeline.main([command]) == 0
+    operation.assert_called_once_with()
+
+
+def test_collect_exit_code_reflects_failed_results(monkeypatch):
+    pipeline = SimpleNamespace(
+        data_root=Path("data"),
+        model="gemini-test",
+        collect=Mock(return_value={
+            "jobs_downloaded": 1,
+            "results_succeeded": 2,
+            "results_failed": 1,
+            "invalid_schema": 1,
+        }),
     )
-    monkeypatch.setattr(
-        run_semantic_pipeline.time, "perf_counter", Mock(side_effect=[10.0, 12.5])
-    )
+    monkeypatch.setattr(run_semantic_pipeline, "build_pipeline", Mock(return_value=pipeline))
 
-    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="failed"):
-        run_semantic_pipeline.process_scene_with_timing(
-            "scene-0061", "video.mp4", "output", "CAM_FRONT", 8
-        )
-
-    assert "status=failed" in caplog.text
-    assert "elapsed_s=2.500" in caplog.text
-    assert "duration=00:00:02.500" in caplog.text
-
-
-def test_log_total_duration_for_all_scenes(monkeypatch, caplog):
-    monkeypatch.setattr(
-        run_semantic_pipeline.time, "perf_counter", Mock(return_value=3723.456)
-    )
-
-    with caplog.at_level(logging.INFO):
-        elapsed_s = run_semantic_pipeline.log_total_duration(
-            started_at=100.0,
-            total=10,
-            succeeded=9,
-            failed=1,
-            corpus_path="artifacts/semantic/semantic_corpus.jsonl",
-        )
-
-    assert elapsed_s == pytest.approx(3623.456)
-    assert "pipeline_complete" in caplog.text
-    assert "total=10" in caplog.text
-    assert "succeeded=9" in caplog.text
-    assert "failed=1" in caplog.text
-    assert "elapsed_s=3623.456" in caplog.text
-    assert "duration=01:00:23.456" in caplog.text
+    assert run_semantic_pipeline.main(["collect"]) == 1
+    pipeline.collect.assert_called_once_with()
