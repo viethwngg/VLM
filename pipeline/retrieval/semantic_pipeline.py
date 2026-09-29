@@ -7,16 +7,25 @@ from .searchable_text import build_searchable_text
 
 LOGGER = logging.getLogger(__name__)
 
+
+def write_scene_metadata(scene, output_root: str | Path) -> Path:
+    """Persist validated metadata in the canonical artifact location."""
+    out = Path(output_root) / scene.scene_id / "semantic_metadata.json"
+    scene.searchable_text = build_searchable_text(scene)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(scene.model_dump(mode="json"), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return out
+
 def process_scene(scene_id: str, video_path: str | Path, output_root: str | Path, camera="CAM_FRONT", num_frames=8, force=False, vlm=None) -> Path:
     out = Path(output_root) / scene_id / "semantic_metadata.json"
     if out.exists() and not force: return out
     frames = sample_video(video_path, camera, num_frames)
     evidence = [f.__dict__ for f in frames]
     scene = (vlm or GeminiVLM()).analyze(scene_id, frames, evidence)
-    scene.searchable_text = build_searchable_text(scene)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(scene.model_dump(mode="json"), ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return out
+    return write_scene_metadata(scene, output_root)
 
 def build_corpus(semantic_root: str | Path) -> Path:
     root = Path(semantic_root); corpus = root / "semantic_corpus.jsonl"; rows = []

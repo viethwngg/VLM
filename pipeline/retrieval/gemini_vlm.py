@@ -1,4 +1,4 @@
-"""Gemini adapter with bounded retries and local schema validation."""
+"""Gemini adapter with bounded retries and shared response validation."""
 import json, logging, math, os, random, time
 from pathlib import Path
 import httpx
@@ -13,6 +13,83 @@ load_dotenv()
 LOGGER = logging.getLogger(__name__)
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODELS = ("gemini-3.7-flash", "gemini-3.5-flash-lite")
+
+
+def build_scene_prompt(scene_id: str) -> str:
+    """Return the single versioned prompt used by sync and batch VLM calls."""
+    return prompt_for_taxonomy() + f"\nScene ID: {scene_id}\nReturn JSON only."
+
+
+def build_scene_parts(scene_id: str, frames: list, file_uri: str, mime_type: str) -> list[dict]:
+    """Build media and temporal context parts without duplicating prompt text."""
+    parts = [{"text": build_scene_prompt(scene_id)}]
+    parts.append({"file_data": {"file_uri": file_uri, "mime_type": mime_type}})
+    for frame in frames:
+        parts.append({
+            "text": (
+                f"Frame camera={frame.camera}, timestamp_s={frame.timestamp_s}, "
+                f"uri={frame.frame_uri}"
+            )
+        })
+    return parts
+
+
+def _json_object(raw: str) -> dict:
+    """Decode a model JSON response, tolerating a surrounding markdown fence."""
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("Gemini response does not contain a JSON object")
+    return json.loads(raw[start:end + 1])
+
+
+def parse_scene_payload(
+    payload,
+    *,
+    scene_id: str,
+    evidence: list[dict] | None,
+    model: str,
+) -> SemanticScene:
+    """Apply the existing metadata schema to either sync or batch output."""
+    if hasattr(payload, "model_dump"):
+        data = payload.model_dump()
+    elif isinstance(payload, dict):
+        data = dict(payload)
+    elif isinstance(payload, str):
+        data = _json_object(payload)
+    else:
+        raise TypeError(f"Unsupported Gemini payload type: {type(payload).__name__}")
+
+    data["scene_id"] = scene_id
+    data["evidence"] = evidence or data.get("evidence", [])
+    data["provenance"] = {
+        "vlm_provider": "gemini",
+        "vlm_model": model,
+        "prompt_version": PROMPT_VERSION,
+        "taxonomy_version": "road-v1",
+        "pipeline_version": "semantic-pipeline-v1",
+    }
+    scene = SemanticScene.model_validate(data)
+    scene.searchable_text = build_searchable_text(scene)
+    return scene
+
+
+def response_text(response) -> str:
+    """Extract generated text from an SDK object or Batch API response dict."""
+    direct = getattr(response, "text", None) or getattr(response, "output_text", None)
+    if direct:
+        return direct
+    if isinstance(response, dict):
+        direct = response.get("text") or response.get("output_text")
+        if direct:
+            return direct
+        texts = []
+        for candidate in response.get("candidates", []):
+            for part in (candidate.get("content") or {}).get("parts", []):
+                if part.get("text"):
+                    texts.append(part["text"])
+        if texts:
+            return "".join(texts)
+    return str(response)
 
 class GeminiVLM:
     def __init__(self, client=None, model: str | None = None, max_retries: int | None = None, processing_timeout: float = 300,
@@ -73,7 +150,7 @@ class GeminiVLM:
             remote = self._file_request(self.client.files.get, scene_id, name=remote.name)
 
     def analyze(self, scene_id: str, frames: list, evidence: list[dict] | None = None) -> SemanticScene:
-        contents = [{"text": prompt_for_taxonomy() + f"\nScene ID: {scene_id}\nReturn JSON only."}]
+        contents = [{"text": build_scene_prompt(scene_id)}]
         uploaded = set()
         for frame in frames:
             uri = str(frame.frame_uri)
@@ -83,9 +160,16 @@ class GeminiVLM:
             if hasattr(self.client, "files") and Path(uri).exists() and uri not in uploaded:
                 remote = self._file_request(self.client.files.upload, scene_id, file=uri)
                 remote = self._wait_for_file(remote, scene_id)
-                contents.append({"file_data": {"file_uri": remote.uri, "mime_type": getattr(remote, "mime_type", "video/mp4")}})
+                contents.append({
+                    "file_data": {
+                        "file_uri": remote.uri,
+                        "mime_type": getattr(remote, "mime_type", "video/mp4"),
+                    }
+                })
                 uploaded.add(uri)
-            contents.append({"text": f"Frame camera={frame.camera}, timestamp_s={frame.timestamp_s}, uri={uri}"})
+            contents.append({
+                "text": f"Frame camera={frame.camera}, timestamp_s={frame.timestamp_s}, uri={frame.frame_uri}"
+            })
         last_error = None
         model_index = 0
         for attempt in range(self.max_retries):
@@ -97,19 +181,13 @@ class GeminiVLM:
                     "automatic_function_calling": {"disable": True},
                 })
                 parsed = getattr(response, "parsed", None)
-                if hasattr(parsed, "model_dump"):
-                    data = parsed.model_dump()
-                elif isinstance(parsed, dict):
-                    data = dict(parsed)
-                else:
-                    raw = getattr(response, "text", None) or getattr(response, "output_text", None) or str(response)
-                    data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-                data["scene_id"] = scene_id
-                data["evidence"] = evidence or data.get("evidence", [])
-                data["provenance"] = {"vlm_provider": "gemini", "vlm_model": active_model, "prompt_version": PROMPT_VERSION, "taxonomy_version": "road-v1", "pipeline_version": "semantic-pipeline-v1"}
-                scene = SemanticScene.model_validate(data)
-                scene.searchable_text = build_searchable_text(scene)
-                return scene
+                payload = parsed if parsed is not None else response_text(response)
+                return parse_scene_payload(
+                    payload,
+                    scene_id=scene_id,
+                    evidence=evidence,
+                    model=active_model,
+                )
             except Exception as exc:
                 can_switch_model = (
                     isinstance(exc, errors.APIError)

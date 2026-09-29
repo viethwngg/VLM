@@ -23,6 +23,7 @@ tmp/
 # Generated artifacts
 artifacts/semantic/*
 !artifacts/semantic/.gitkeep
+artifacts/vlm_batch/*
 artifacts/embeddings/*
 artifacts/index/*
 

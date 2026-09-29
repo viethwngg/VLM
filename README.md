@@ -117,6 +117,55 @@ Mỗi dòng cần tối thiểu:
 
 ## Chạy pipeline
 
+### Gemini VLM Batch Processing
+
+Batch mode dùng Gemini Developer API (`GEMINI_API_KEY`), không dùng Vertex AI.
+Sync command hiện tại vẫn là workflow mặc định và không bị thay đổi. Cấu hình
+batch tùy chọn: `GEMINI_MODEL`, `VLM_BATCH_SIZE` (mặc định `100`) và
+`VLM_BATCH_DIR` (mặc định `artifacts/vlm_batch`).
+
+PowerShell:
+
+```powershell
+$env:GEMINI_API_KEY="YOUR_KEY"
+python .\scripts\run_vlm_batch.py prepare --limit 3
+python .\scripts\run_vlm_batch.py submit
+python .\scripts\run_vlm_batch.py status
+python .\scripts\run_vlm_batch.py download
+```
+
+Linux/macOS:
+
+```bash
+export GEMINI_API_KEY=YOUR_KEY
+python scripts/run_vlm_batch.py prepare --limit 3
+python scripts/run_vlm_batch.py submit
+python scripts/run_vlm_batch.py status
+python scripts/run_vlm_batch.py download
+```
+
+Full dataset:
+
+```bash
+python scripts/run_vlm_batch.py prepare
+python scripts/run_vlm_batch.py submit
+```
+
+Sau khi job hoàn tất, download kết quả rồi retry riêng các request lỗi tạm thời:
+
+```bash
+python scripts/run_vlm_batch.py status
+python scripts/run_vlm_batch.py download
+python scripts/run_vlm_batch.py retry-failed
+```
+
+`run` chỉ thực hiện `prepare -> submit` rồi thoát; nó không giữ terminal để
+poll hàng giờ. Upload manifest, batch job, raw results và failed requests được
+lưu dưới `artifacts/vlm_batch/`. Scene đã có `semantic_metadata.json` hợp lệ sẽ
+được bỏ qua; mỗi split `batch_0001`, `batch_0002`, ... có JSONL và job state
+riêng. Sau `download`, metadata vẫn dùng schema và đường dẫn cũ, rồi semantic
+corpus được rebuild để embedding pipeline hiện tại tiếp tục hoạt động.
+
 ### 1. Tạo semantic metadata
 
 Chạy không có tham số sẽ tự động quét đệ quy và xử lý toàn bộ video trong
